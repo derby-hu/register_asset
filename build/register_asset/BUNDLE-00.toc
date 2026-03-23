@@ -1,0 +1,3 @@
+([('register_asset',
+   '/Users/hty/Downloads/register_asset-main/dist/register_asset',
+   'EXECUTABLE')],)
