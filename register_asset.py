@@ -21,6 +21,7 @@ import requests
 import re
 import os
 import tempfile
+import logging
 from smb.SMBConnection import SMBConnection
 import openpyxl
 
@@ -48,6 +49,25 @@ NAS_PASSWORD = "Hu7211xh"
 NAS_SHARE = "公司公共"
 NAS_PATH = "使用指南/内网MAC.xlsx"
 # =============================================================
+
+
+def setup_logger():
+    """初始化文件日志，便于 EXE 无控制台模式下调试"""
+    log_dir = os.path.join(tempfile.gettempdir(), "register_asset")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "register_asset.log")
+
+    logger = logging.getLogger("register_asset")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger, log_path
+
+
+logger, LOG_FILE_PATH = setup_logger()
 
 class DingTalkClient:
     """钉钉客户端类，用于处理用户验证和通知"""
@@ -168,14 +188,18 @@ class DingTalkClient:
     def notify_admin(self, name, count):
         """通知网管"""
         if not ADMIN_USER_ID: 
-            print("⚠️ 未配置管理员ID，跳过通知")
-            return
+            msg = "未配置管理员ID，已跳过管理员通知。"
+            logger.warning(msg)
+            print(f"⚠️ {msg}")
+            return False, msg
         
         try:
             token = self.get_access_token()
             url = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
             params = {"access_token": token}
             content = f"新资产登记提醒\n员工：{name}\n数量：{count} 个 MAC 地址\n已自动存入 NAS 文件。"
+            masked_admin = f"***{ADMIN_USER_ID[-4:]}" if len(ADMIN_USER_ID) >= 4 else "***"
+            logger.info("开始发送管理员通知: user=%s, count=%s, admin=%s", name, count, masked_admin)
             data = {
                 "agent_id": DINGTALK_AGENT_ID,
                 "userid_list": ADMIN_USER_ID,
@@ -188,12 +212,21 @@ class DingTalkClient:
             resp = requests.post(url, json=data, params=params, timeout=10)
             res = resp.json()
             
-            if res.get("errcode") == 0:
-                print(f"📧 管理员通知发送成功")
-            else:
-                print(f"⚠️ 管理员通知发送失败：{res.get('errmsg')}")
+            if res.get("errcode") == 0 or res.get("code") == 0:
+                msg = "管理员通知发送成功"
+                logger.info("%s, response=%s", msg, res)
+                print("📧 管理员通知发送成功")
+                return True, msg
+
+            msg = f"管理员通知发送失败：{res.get('errmsg') or res}"
+            logger.error(msg)
+            print(f"⚠️ {msg}")
+            return False, msg
         except Exception as e:
-            print(f"⚠️ 管理员通知发送异常：{e}")
+            msg = f"管理员通知发送异常：{e}"
+            logger.exception(msg)
+            print(f"⚠️ {msg}")
+            return False, msg
 
 
 def read_nas_excel():
@@ -441,6 +474,7 @@ def main():
     root.withdraw()
     
     print("🚀 正在启动资产登记助手...")
+    logger.info("程序启动")
     
     global client
     try:
@@ -455,6 +489,7 @@ def main():
             return
             
     except Exception as e:
+        logger.exception("初始化失败: %s", e)
         messagebox.showerror("初始化失败", str(e))
         return
 
@@ -584,7 +619,12 @@ def main():
             messagebox.showinfo("完成", msg)
             # 通知网管
             print("📧 准备发送管理员通知...")
-            client.notify_admin(user['name'], success_count)
+            notify_ok, notify_msg = client.notify_admin(user['name'], success_count)
+            if not notify_ok:
+                messagebox.showwarning(
+                    "管理员通知失败",
+                    f"{notify_msg}\n\n请联系管理员排查。\n日志文件：{LOG_FILE_PATH}"
+                )
         else:
             messagebox.showerror("失败", "所有 MAC 地址写入失败。\n请查看控制台日志或检查NAS连接。")
         
@@ -593,6 +633,7 @@ def main():
             
     except Exception as e:
         # 错误处理
+        logger.exception("更新失败: %s", e)
         progress_win.destroy()
         root.destroy()
         messagebox.showerror("错误", f"更新失败：{e}")
