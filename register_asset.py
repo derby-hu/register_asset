@@ -21,7 +21,7 @@ import requests
 import re
 import os
 import tempfile
-from smb.SMBConnection import SMBConnection
+from requests.auth import HTTPBasicAuth
 import openpyxl
 
 # 设置默认编码为UTF-8
@@ -41,12 +41,13 @@ DINGTALK_AGENT_ID = "4370174606"
 # 2. 网管通知 (可选: 填入网管的 userid，留空则不发送)
 ADMIN_USER_ID = "314556586532459634" 
 
-# 3. NAS配置 (用于保存Excel文件)
-NAS_SERVER = "nas"
-NAS_USER = "胡学海"
-NAS_PASSWORD = "Hu7211xh"
-NAS_SHARE = "公司公共"
-NAS_PATH = "使用指南/内网MAC.xlsx"
+# 3. NAS配置 (用于保存Excel文件，WebDAV协议)
+NAS_SERVER = "192.168.3.123"
+NAS_PORT = 5005
+NAS_USER = "admin"
+NAS_PASSWORD = "ZhJJW_2024"
+NAS_WEBDAV_URL = f"http://{NAS_SERVER}:{NAS_PORT}"
+NAS_PATH = "home/MAC.xlsx"
 # =============================================================
 
 class DingTalkClient:
@@ -199,40 +200,36 @@ class DingTalkClient:
 def read_nas_excel():
     """读取NAS Excel文件所有记录"""
     try:
-        # 连接NAS服务器
-        conn = SMBConnection(NAS_USER, NAS_PASSWORD, "client", NAS_SERVER, use_ntlm_v2=True)
-        connected = conn.connect(NAS_SERVER, 445)
-        
-        if not connected:
-            raise Exception("无法连接到NAS服务器")
-        
-        # 下载文件到临时位置
+        file_url = f"{NAS_WEBDAV_URL}/{NAS_PATH}"
+        auth = HTTPBasicAuth(NAS_USER, NAS_PASSWORD)
+
+        response = requests.get(file_url, auth=auth, timeout=30)
+        if response.status_code == 404:
+            print("ℹ️ NAS文件不存在，将创建新文件")
+            return []
+        if response.status_code != 200:
+            raise Exception(f"无法下载NAS文件，状态码: {response.status_code}")
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             tmp_path = tmp_file.name
-        
-        with open(tmp_path, 'wb') as local_file:
-            conn.retrieveFile(NAS_SHARE, NAS_PATH, local_file)
-        
-        # 读取Excel文件
+            tmp_file.write(response.content)
+
         wb = openpyxl.load_workbook(tmp_path)
         ws = wb.active
-        
-        # 解析记录
+
         records = []
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[0]:  # MAC地址不为空
+            if row[0]:
                 records.append({
                     'mac': row[0],
                     'valid_date': row[1],
                     'description': row[2]
                 })
-        
-        # 清理资源
-        conn.close()
+
         os.unlink(tmp_path)
-        
+
         return records
-        
+
     except Exception as e:
         print(f"读取NAS文件失败：{e}")
         return []
@@ -240,42 +237,51 @@ def read_nas_excel():
 def add_record_to_nas_excel(mac_address, user_name):
     """添加记录到NAS Excel文件"""
     try:
-        # 连接NAS服务器
-        conn = SMBConnection(NAS_USER, NAS_PASSWORD, "client", NAS_SERVER, use_ntlm_v2=True)
-        connected = conn.connect(NAS_SERVER, 445)
-        
-        if not connected:
-            raise Exception("无法连接到NAS服务器")
-        
-        # 下载文件到临时位置
+        file_url = f"{NAS_WEBDAV_URL}/{NAS_PATH}"
+        auth = HTTPBasicAuth(NAS_USER, NAS_PASSWORD)
+
+        response = requests.get(file_url, auth=auth, timeout=30)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             tmp_path = tmp_file.name
         
-        with open(tmp_path, 'wb') as local_file:
-            conn.retrieveFile(NAS_SHARE, NAS_PATH, local_file)
-        
-        # 读取Excel文件
-        wb = openpyxl.load_workbook(tmp_path)
-        ws = wb.active
-        
-        # 新增记录
+        if response.status_code == 200:
+            # 文件存在，下载并处理
+            with open(tmp_path, 'wb') as f:
+                f.write(response.content)
+            wb = openpyxl.load_workbook(tmp_path)
+            ws = wb.active
+            
+        elif response.status_code == 404:
+            # 文件不存在，创建新文件
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.cell(row=1, column=1, value='MAC')
+            ws.cell(row=1, column=2, value='有效日期')
+            ws.cell(row=1, column=3, value='描述（请输入0-128位字符）')
+            
+        else:
+            os.unlink(tmp_path)
+            raise Exception(f"无法下载NAS文件，状态码: {response.status_code}")
+
         new_row = ws.max_row + 1
         ws.cell(row=new_row, column=1, value=mac_address)
         ws.cell(row=new_row, column=2, value=0)
         ws.cell(row=new_row, column=3, value=user_name)
-        
-        # 保存并上传
+
         wb.save(tmp_path)
-        
-        with open(tmp_path, 'rb') as local_file:
-            conn.storeFile(NAS_SHARE, NAS_PATH, local_file)
-        
-        # 清理资源
-        conn.close()
+
+        with open(tmp_path, 'rb') as f:
+            file_data = f.read()
+
+        put_response = requests.put(file_url, data=file_data, auth=auth, timeout=30)
+        if put_response.status_code not in (200, 201, 204):
+            raise Exception(f"上传失败，状态码: {put_response.status_code}")
+
         os.unlink(tmp_path)
-        
+
         return True
-        
+
     except Exception as e:
         print(f"写入NAS文件失败：{e}")
         return False
@@ -438,25 +444,60 @@ class RegDialog(tk.Toplevel):
 def main():
     """主函数"""
     root = tk.Tk()
-    root.withdraw()
+    
+    # 设置主窗口样式（与操作界面一致）
+    root.title("君问公司资产自动登记")
+    root.geometry("400x200")
+    root.resizable(False, False)
+    root.attributes('-topmost', True)
+    root.configure(bg="#f5f5f5")
+    
+    # 设置样式（与操作界面一致）
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure('TFrame', background='#f5f5f5')
+    style.configure('TLabel', background='#f5f5f5', font=('Microsoft YaHei', 10), foreground='#666666')
+    style.configure('Header.TLabel', background='#f5f5f5', font=('Microsoft YaHei', 14, 'bold'), foreground='#333333')
+    
+    # 标题区域（与操作界面一致）
+    header_frame = ttk.Frame(root, style='TFrame')
+    header_frame.pack(fill='x', padx=30, pady=(30, 10))
+    ttk.Label(header_frame, text="君问公司资产自动登记工具", style='Header.TLabel').pack()
+    
+    # 提示文字（与操作界面一致）
+    ttk.Label(root, text="程序正在启动，请稍等……", style='TLabel').pack(pady=20)
+    
+    root.update()
     
     print("🚀 正在启动资产登记助手...")
     
     global client
+    
     try:
-        # 初始化钉钉客户端
+        print("📱 初始化钉钉客户端...")
         client = DingTalkClient(DINGTALK_APP_KEY, DINGTALK_APP_SECRET)
         
-        # 1. 获取员工列表
         print("📞 正在同步通讯录...")
         users = client.get_all_users()
+        
         if not users:
             messagebox.showerror("错误", "无法获取通讯录，请检查 AppKey/Secret 及权限。")
+            root.destroy()
             return
+            
+        print(f"✅ 成功获取 {len(users)} 名员工信息")
             
     except Exception as e:
         messagebox.showerror("初始化失败", str(e))
+        root.destroy()
         return
+    
+    # 关闭启动界面，显示操作窗口
+    root.destroy()
+    
+    # 创建新的主窗口
+    root = tk.Tk()
+    root.withdraw()
 
     # 2. 弹出交互窗口
     dialog = RegDialog(root, users)
@@ -522,49 +563,58 @@ def main():
     root.update()
 
     try:
-        # 5.1 删除与当前MAC地址相关的所有记录（无论用户名是谁）
         print("  🗑️ 删除相关记录...")
+
+        file_url = f"{NAS_WEBDAV_URL}/{NAS_PATH}"
+        auth = HTTPBasicAuth(NAS_USER, NAS_PASSWORD)
+
+        response = requests.get(file_url, auth=auth, timeout=30)
         
-        # 连接NAS服务器
-        conn = SMBConnection(NAS_USER, NAS_PASSWORD, "client", NAS_SERVER, use_ntlm_v2=True)
-        connected = conn.connect(NAS_SERVER, 445)
-        
-        if not connected:
-            raise Exception("无法连接到NAS服务器")
-        
-        # 下载文件到临时位置
+        # 创建临时文件
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             tmp_path = tmp_file.name
         
-        with open(tmp_path, 'wb') as local_file:
-            conn.retrieveFile(NAS_SHARE, NAS_PATH, local_file)
-        
-        # 读取Excel文件
-        wb = openpyxl.load_workbook(tmp_path)
-        ws = wb.active
-        
-        # 记录需要删除的行（从下往上删除）
-        rows_to_delete = []
-        for row_idx in range(2, ws.max_row + 1):
-            mac_value = ws.cell(row=row_idx, column=1).value
-            if mac_value in macs:
-                rows_to_delete.append(row_idx)
-        
-        # 从下往上删除行
-        for row_idx in sorted(rows_to_delete, reverse=True):
-            ws.delete_rows(row_idx)
-        
-        # 保存并上传
-        wb.save(tmp_path)
-        
-        with open(tmp_path, 'rb') as local_file:
-            conn.storeFile(NAS_SHARE, NAS_PATH, local_file)
-        
-        # 清理资源
-        conn.close()
-        os.unlink(tmp_path)
-        
-        print(f"  ✅ 删除了 {len(rows_to_delete)} 条相关记录")
+        if response.status_code == 200:
+            # 文件存在，下载并处理
+            with open(tmp_path, 'wb') as f:
+                f.write(response.content)
+            
+            wb = openpyxl.load_workbook(tmp_path)
+            ws = wb.active
+
+            # 删除相关记录
+            rows_to_delete = []
+            for row_idx in range(2, ws.max_row + 1):
+                mac_value = ws.cell(row=row_idx, column=1).value
+                if mac_value in macs:
+                    rows_to_delete.append(row_idx)
+
+            for row_idx in sorted(rows_to_delete, reverse=True):
+                ws.delete_rows(row_idx)
+
+            wb.save(tmp_path)
+
+            # 上传处理后的文件
+            with open(tmp_path, 'rb') as f:
+                file_data = f.read()
+
+            put_response = requests.put(file_url, data=file_data, auth=auth, timeout=30)
+            if put_response.status_code not in (200, 201, 204):
+                os.unlink(tmp_path)
+                raise Exception(f"上传失败，状态码: {put_response.status_code}")
+
+            os.unlink(tmp_path)
+
+            print(f"  ✅ 删除了 {len(rows_to_delete)} 条相关记录")
+            
+        elif response.status_code == 404:
+            # 文件不存在，创建新文件
+            os.unlink(tmp_path)
+            print("  ℹ️ 文件不存在，将创建新文件")
+            
+        else:
+            os.unlink(tmp_path)
+            raise Exception(f"无法下载NAS文件，状态码: {response.status_code}")
         
         # 5.2 新增当前记录
         success_count = 0
@@ -599,14 +649,12 @@ def main():
         print(f"❌ 更新失败：{e}")
 
 if __name__ == "__main__":
-    # 依赖检查
     try:
         import psutil, requests, tkinter
-        from smb.SMBConnection import SMBConnection
         import openpyxl
     except ImportError as e:
         print(f"❌ 缺少依赖库：{e}")
-        print("请运行命令安装：pip install psutil requests pysmb openpyxl")
+        print("请运行命令安装：pip install psutil requests openpyxl")
         input("按回车退出...")
         sys.exit(1)
     
