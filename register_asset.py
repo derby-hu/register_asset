@@ -32,22 +32,26 @@ if sys.platform == 'win32':
     except:
         pass
 
-# ======================= 配置区域 (必填) =======================
-# 1. 钉钉应用凭证
-DINGTALK_APP_KEY = "dingpuvsoo0clmrrbie9"
-DINGTALK_APP_SECRET = "vRR7pFe8q3QjUPjsZysJAWEIb6pM6yW5wdrykptKum1LejuOcgqJyFQWuhlGTpjm"
-DINGTALK_AGENT_ID = "4370174606"
+# ======================= 配置导入 =======================
+# 从外部配置文件导入敏感信息
+try:
+    from config import (
+        DINGTALK_APP_KEY,
+        DINGTALK_APP_SECRET,
+        DINGTALK_AGENT_ID,
+        ADMIN_USER_ID,
+        NAS_SERVER,
+        NAS_PORT,
+        NAS_USER,
+        NAS_PASSWORD,
+        NAS_PATH
+    )
+except ImportError:
+    print("❌ 未找到配置文件 config.py，请复制 config.example.py 并填写配置")
+    exit(1)
 
-# 2. 网管通知 (可选: 填入网管的 userid，留空则不发送)
-ADMIN_USER_ID = "314556586532459634" 
-
-# 3. NAS配置 (用于保存Excel文件，WebDAV协议)
-NAS_SERVER = "192.168.3.123"
-NAS_PORT = 5005
-NAS_USER = "admin"
-NAS_PASSWORD = "ZhJJW_2024"
+# 计算 WebDAV URL
 NAS_WEBDAV_URL = f"http://{NAS_SERVER}:{NAS_PORT}"
-NAS_PATH = "home/MAC.xlsx"
 # =============================================================
 
 class DingTalkClient:
