@@ -5,9 +5,8 @@
 功能：
 1. 通过钉钉进行用户身份验证
 2. 自动扫描本机物理网卡MAC地址
-3. 将MAC地址登记到NAS服务器的Excel文件
-4. 智能检测重复登记
-5. 通知管理员进行手工操作
+3. 将MAC地址登记信息生成Excel文件
+4. 通过钉钉将Excel文件发送给管理员进行处理
 """
 
 import sys
@@ -21,14 +20,19 @@ import requests
 import re
 import os
 import tempfile
-from requests.auth import HTTPBasicAuth
+import datetime
 import openpyxl
 
-# 设置默认编码为UTF-8
+# 设置默认编码为UTF-8（解决Windows控制台GBK编码不支持emoji的问题）
 if sys.platform == 'win32':
     import locale
     try:
         locale.setlocale(locale.LC_ALL, 'zh_CN.UTF-8')
+    except:
+        pass
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
     except:
         pass
 
@@ -40,18 +44,10 @@ try:
         DINGTALK_APP_SECRET,
         DINGTALK_AGENT_ID,
         ADMIN_USER_ID,
-        NAS_SERVER,
-        NAS_PORT,
-        NAS_USER,
-        NAS_PASSWORD,
-        NAS_PATH
     )
 except ImportError:
     print("❌ 未找到配置文件 config.py，请复制 config.example.py 并填写配置")
     exit(1)
-
-# 计算 WebDAV URL
-NAS_WEBDAV_URL = f"http://{NAS_SERVER}:{NAS_PORT}"
 # =============================================================
 
 class DingTalkClient:
@@ -171,7 +167,7 @@ class DingTalkClient:
         raise Exception(f"发送失败：{res}")
 
     def notify_admin(self, name, count):
-        """通知网管"""
+        """通知网管（纯文本提示）"""
         if not ADMIN_USER_ID: 
             print("⚠️ 未配置管理员ID，跳过通知")
             return
@@ -180,7 +176,7 @@ class DingTalkClient:
             token = self.get_access_token()
             url = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
             params = {"access_token": token}
-            content = f"新资产登记提醒\n员工：{name}\n数量：{count} 个 MAC 地址\n已自动存入 NAS 文件。"
+            content = f"新资产登记提醒\n员工：{name}\n数量：{count} 个 MAC 地址\n登记信息Excel文件已通过附件方式发送，请查收。"
             data = {
                 "agent_id": DINGTALK_AGENT_ID,
                 "userid_list": ADMIN_USER_ID,
@@ -194,101 +190,113 @@ class DingTalkClient:
             res = resp.json()
             
             if res.get("errcode") == 0:
-                print(f"📧 管理员通知发送成功")
+                print(f"📧 管理员文本通知发送成功")
             else:
-                print(f"⚠️ 管理员通知发送失败：{res.get('errmsg')}")
+                print(f"⚠️ 管理员文本通知发送失败：{res.get('errmsg')}")
         except Exception as e:
-            print(f"⚠️ 管理员通知发送异常：{e}")
+            print(f"⚠️ 管理员文本通知发送异常：{e}")
 
+    def upload_media(self, file_path):
+        """上传媒体文件到钉钉，返回media_id"""
+        try:
+            token = self.get_access_token()
+            url = "https://oapi.dingtalk.com/media/upload"
+            params = {"access_token": token, "type": "file"}
+            
+            if not os.path.exists(file_path):
+                raise Exception(f"文件不存在: {file_path}")
+            
+            with open(file_path, 'rb') as f:
+                files = {"media": (os.path.basename(file_path), f, "application/octet-stream")}
+                resp = requests.post(url, params=params, files=files, timeout=60)
+            
+            res = resp.json()
+            if res.get("errcode") == 0:
+                media_id = res.get("media_id")
+                print(f"✅ 媒体文件上传成功，media_id: {str(media_id)[:20]}...")
+                return media_id
+            else:
+                raise Exception(f"上传失败: {res}")
+        except Exception as e:
+            print(f"⚠️ 媒体文件上传异常：{e}")
+            return None
 
-def read_nas_excel():
-    """读取NAS Excel文件所有记录"""
-    try:
-        file_url = f"{NAS_WEBDAV_URL}/{NAS_PATH}"
-        auth = HTTPBasicAuth(NAS_USER, NAS_PASSWORD)
-
-        response = requests.get(file_url, auth=auth, timeout=30)
-        if response.status_code == 404:
-            print("ℹ️ NAS文件不存在，将创建新文件")
-            return []
-        if response.status_code != 200:
-            raise Exception(f"无法下载NAS文件，状态码: {response.status_code}")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-            tmp_path = tmp_file.name
-            tmp_file.write(response.content)
-
-        wb = openpyxl.load_workbook(tmp_path)
-        ws = wb.active
-
-        records = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[0]:
-                records.append({
-                    'mac': row[0],
-                    'valid_date': row[1],
-                    'description': row[2]
-                })
-
-        os.unlink(tmp_path)
-
-        return records
-
-    except Exception as e:
-        print(f"读取NAS文件失败：{e}")
-        return []
-
-def add_record_to_nas_excel(mac_address, user_name):
-    """添加记录到NAS Excel文件"""
-    try:
-        file_url = f"{NAS_WEBDAV_URL}/{NAS_PATH}"
-        auth = HTTPBasicAuth(NAS_USER, NAS_PASSWORD)
-
-        response = requests.get(file_url, auth=auth, timeout=30)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-            tmp_path = tmp_file.name
+    def send_file_to_admin(self, file_path, name, count, macs):
+        """将Excel文件发送给管理员"""
+        if not ADMIN_USER_ID:
+            print("⚠️ 未配置管理员ID，跳过发送文件")
+            return False
         
-        if response.status_code == 200:
-            # 文件存在，下载并处理
-            with open(tmp_path, 'wb') as f:
-                f.write(response.content)
-            wb = openpyxl.load_workbook(tmp_path)
-            ws = wb.active
+        media_id = self.upload_media(file_path)
+        if not media_id:
+            return False
+        
+        try:
+            token = self.get_access_token()
+            url = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
+            params = {"access_token": token}
             
-        elif response.status_code == 404:
-            # 文件不存在，创建新文件
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.cell(row=1, column=1, value='MAC')
-            ws.cell(row=1, column=2, value='有效日期')
-            ws.cell(row=1, column=3, value='描述（请输入0-128位字符）')
+            data = {
+                "agent_id": DINGTALK_AGENT_ID,
+                "userid_list": ADMIN_USER_ID,
+                "msg": {
+                    "msgtype": "file",
+                    "file": {"media_id": media_id}
+                }
+            }
             
-        else:
-            os.unlink(tmp_path)
-            raise Exception(f"无法下载NAS文件，状态码: {response.status_code}")
+            resp = requests.post(url, json=data, params=params, timeout=10)
+            res = resp.json()
+            
+            if res.get("errcode") == 0:
+                print(f"📎 Excel文件已通过钉钉发送给管理员")
+                return True
+            else:
+                print(f"⚠️ 文件发送失败：{res.get('errmsg')}")
+                return False
+        except Exception as e:
+            print(f"⚠️ 文件发送异常：{e}")
+            return False
 
-        new_row = ws.max_row + 1
-        ws.cell(row=new_row, column=1, value=mac_address)
-        ws.cell(row=new_row, column=2, value=0)
-        ws.cell(row=new_row, column=3, value=user_name)
 
-        wb.save(tmp_path)
-
-        with open(tmp_path, 'rb') as f:
-            file_data = f.read()
-
-        put_response = requests.put(file_url, data=file_data, auth=auth, timeout=30)
-        if put_response.status_code not in (200, 201, 204):
-            raise Exception(f"上传失败，状态码: {put_response.status_code}")
-
-        os.unlink(tmp_path)
-
-        return True
-
+def generate_mac_excel(user_name, macs):
+    """生成MAC登记信息的Excel文件，返回临时文件路径"""
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^\w\u4e00-\u9fa5]", "_", user_name)
+        file_name = f"MAC登记_{safe_name}_{ts}.xlsx"
+        
+        tmp_dir = tempfile.gettempdir()
+        file_path = os.path.join(tmp_dir, file_name)
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "MAC登记"
+        
+        
+        # 数据表头
+        ws.cell(row=1, column=1, value='MAC')
+        ws.cell(row=1, column=2, value='有效日期')
+        ws.cell(row=1, column=3, value='描述（请输入0-128位字符）')
+        
+        for idx, mac in enumerate(macs, start=1):
+            row_no = 1 + idx
+            ws.cell(row=row_no, column=1, value=mac)
+            ws.cell(row=row_no, column=2, value=0)
+            ws.cell(row=row_no, column=3, value=user_name)
+        
+        # 简单调整列宽
+        ws.column_dimensions['A'].width = 25
+        ws.column_dimensions['B'].width = 12
+        ws.column_dimensions['C'].width = 40
+        
+        wb.save(file_path)
+        print(f"📄 Excel已生成：{file_path} ({os.path.getsize(file_path)} bytes)")
+        return file_path
     except Exception as e:
-        print(f"写入NAS文件失败：{e}")
-        return False
+        print(f"❌ 生成Excel失败：{e}")
+        return None
+
 
 def generate_code():
     """生成6位数字验证码"""
@@ -522,125 +530,48 @@ def main():
         messagebox.showerror("错误", "未检测到任何物理网卡地址。\n请检查网络连接或联系管理员。")
         return
 
-    # 4. 检查已有记录
-    print("🔍 正在检查已有记录...")
-    all_records = read_nas_excel()
+    # 4. 显示扫描到的网卡
+    print(f"✅ 扫描到 {len(macs)} 个物理网卡：")
+    for m in macs:
+        print(f"   - {m}")
     
-    # 检查每条MAC地址的记录
-    need_update = False
-    existing_macs_with_user = []
-    
-    for mac in macs:
-        found = False
-        for record in all_records:
-            if record['mac'] == mac:
-                found = True
-                if record['description'] != user['name']:
-                    # 用户名不同，需要更新
-                    need_update = True
-                else:
-                    existing_macs_with_user.append(mac)
-                break
-        if not found:
-            # 没找到对应记录，需要更新
-            need_update = True
-    
-    # 检查记录条数是否一致
-    if len(existing_macs_with_user) != len(macs):
-        need_update = True
-    
-    # 如果所有记录都一致，不需要更新
-    if not need_update:
-        messagebox.showinfo("提示", "本机已完成登记，无须重复登记。")
-        root.destroy()
-        return
-    
-    # 5. 更新记录
-    print("📝 记录不一致，开始更新...")
+    # 5. 生成Excel并发送给管理员
+    print("📝 正在生成登记信息Excel文件...")
     
     # 显示进度
     progress_win = tk.Toplevel(root)
     progress_win.title("处理中")
-    progress_win.geometry("300x100")
+    progress_win.geometry("320x110")
     progress_win.attributes('-topmost', True)
-    ttk.Label(progress_win, text=f"发现 {len(macs)} 个网卡\n正在更新 NAS 文件...").pack(pady=20)
+    ttk.Label(progress_win, text=f"发现 {len(macs)} 个网卡\n正在生成Excel并发送给管理员...").pack(pady=20)
     root.update()
 
+    excel_path = None
     try:
-        print("  🗑️ 删除相关记录...")
-
-        file_url = f"{NAS_WEBDAV_URL}/{NAS_PATH}"
-        auth = HTTPBasicAuth(NAS_USER, NAS_PASSWORD)
-
-        response = requests.get(file_url, auth=auth, timeout=30)
+        # 生成Excel
+        excel_path = generate_mac_excel(user['name'], macs)
+        if not excel_path:
+            raise Exception("Excel文件生成失败")
         
-        # 创建临时文件
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-            tmp_path = tmp_file.name
+        print("📤 正在通过钉钉发送Excel给管理员...")
         
-        if response.status_code == 200:
-            # 文件存在，下载并处理
-            with open(tmp_path, 'wb') as f:
-                f.write(response.content)
-            
-            wb = openpyxl.load_workbook(tmp_path)
-            ws = wb.active
-
-            # 删除相关记录
-            rows_to_delete = []
-            for row_idx in range(2, ws.max_row + 1):
-                mac_value = ws.cell(row=row_idx, column=1).value
-                if mac_value in macs:
-                    rows_to_delete.append(row_idx)
-
-            for row_idx in sorted(rows_to_delete, reverse=True):
-                ws.delete_rows(row_idx)
-
-            wb.save(tmp_path)
-
-            # 上传处理后的文件
-            with open(tmp_path, 'rb') as f:
-                file_data = f.read()
-
-            put_response = requests.put(file_url, data=file_data, auth=auth, timeout=30)
-            if put_response.status_code not in (200, 201, 204):
-                os.unlink(tmp_path)
-                raise Exception(f"上传失败，状态码: {put_response.status_code}")
-
-            os.unlink(tmp_path)
-
-            print(f"  ✅ 删除了 {len(rows_to_delete)} 条相关记录")
-            
-        elif response.status_code == 404:
-            # 文件不存在，创建新文件
-            os.unlink(tmp_path)
-            print("  ℹ️ 文件不存在，将创建新文件")
-            
-        else:
-            os.unlink(tmp_path)
-            raise Exception(f"无法下载NAS文件，状态码: {response.status_code}")
+        # 发送文本通知 + Excel附件
+        file_sent = client.send_file_to_admin(excel_path, user['name'], len(macs), macs)
+        client.notify_admin(user['name'], len(macs))
         
-        # 5.2 新增当前记录
-        success_count = 0
-        for mac in macs:
-            if add_record_to_nas_excel(mac, user['name']):
-                success_count += 1
-                print(f"  ✅ 新增：{mac}")
-            else:
-                print(f"  ❌ 新增 {mac} 失败")
+        success_count = len(macs)
         
         # 清理进度窗口
         progress_win.destroy()
         
         # 6. 结果反馈
-        if success_count > 0:
-            msg = f"登记成功！\n\n员工：{user['name']}\n成功写入：{success_count} 个 MAC 地址\n数据已同步至 NAS 文件。"
-            messagebox.showinfo("完成", msg)
-            # 通知网管
-            print("📧 准备发送管理员通知...")
-            client.notify_admin(user['name'], success_count)
+        msg = f"登记完成！\n\n员工：{user['name']}\n成功登记：{success_count} 个 MAC 地址\n"
+        if file_sent:
+            msg += "登记Excel已发送给管理员。"
         else:
-            messagebox.showerror("失败", "所有 MAC 地址写入失败。\n请查看控制台日志或检查NAS连接。")
+            msg += "Excel发送失败，请手动将文件交给管理员。\n文件位置：\n" + excel_path
+        
+        messagebox.showinfo("完成", msg)
         
         # 最后销毁主窗口
         root.destroy()
@@ -648,9 +579,11 @@ def main():
     except Exception as e:
         # 错误处理
         progress_win.destroy()
+        # 保留生成的临时文件便于排错
         root.destroy()
-        messagebox.showerror("错误", f"更新失败：{e}")
-        print(f"❌ 更新失败：{e}")
+        extra = f"\n生成的文件：{excel_path}" if excel_path else ""
+        messagebox.showerror("错误", f"登记失败：{e}{extra}")
+        print(f"❌ 登记失败：{e}")
 
 if __name__ == "__main__":
     try:
