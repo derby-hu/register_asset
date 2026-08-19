@@ -1,5 +1,4 @@
 psutil
 requests
-pysmb
 openpyxl
 pyinstaller

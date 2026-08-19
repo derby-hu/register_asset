@@ -13,14 +13,16 @@ import sys
 import time
 import random
 import string
+import re
+import os
+import json
+import subprocess
+import tempfile
+import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 import psutil
 import requests
-import re
-import os
-import tempfile
-import datetime
 import openpyxl
 
 # 设置默认编码为UTF-8（解决Windows控制台GBK编码不支持emoji的问题）
@@ -28,12 +30,12 @@ if sys.platform == 'win32':
     import locale
     try:
         locale.setlocale(locale.LC_ALL, 'zh_CN.UTF-8')
-    except:
+    except Exception:
         pass
     try:
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stderr.reconfigure(encoding='utf-8')
-    except:
+    except Exception:
         pass
 
 # ======================= 配置导入 =======================
@@ -46,7 +48,12 @@ try:
         ADMIN_USER_ID,
     )
 except ImportError:
-    print("❌ 未找到配置文件 config.py，请复制 config.example.py 并填写配置")
+    try:
+        _rt = tk.Tk(); _rt.withdraw()
+        messagebox.showerror("配置缺失", "未找到配置文件 config.py\n请复制 config.example.py 并填写配置。")
+        _rt.destroy()
+    except Exception:
+        pass
     exit(1)
 # =============================================================
 
@@ -104,16 +111,13 @@ class DingTalkClient:
             
             for dept in departments:
                 dept_id = dept.get('id')
-                dept_name = dept.get('name')
                 try:
                     users = self.get_user_list(dept_id)
                     if users:
                         all_users.extend(users)
-                except Exception as e:
-                    print(f"获取部门 '{dept_name}' (ID:{dept_id}) 用户失败: {e}")
+                except Exception:
                     continue
             
-            # 去重
             unique_users = {u.get('userid'): u for u in all_users}
             return list(unique_users.values())
             
@@ -143,120 +147,64 @@ class DingTalkClient:
             except Exception as e:
                 raise Exception(f"获取通讯录异常: {e}")
         
-        # 过滤没有手机号的用户
         return [u for u in all_users if u.get('mobile')]
 
-    def send_verify_code(self, userid, code):
-        """发送验证码"""
+    def _send_work_msg(self, userid, msg):
+        """统一封装发送工作通知，失败抛异常"""
         token = self.get_access_token()
         url = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
         params = {"access_token": token}
         data = {
             "agent_id": DINGTALK_AGENT_ID,
             "userid_list": userid,
-            "msg": {
-                "msgtype": "text",
-                "text": {"content": f"【资产登记】您的验证码是：{code}\n有效期 5 分钟。"}
-            }
+            "msg": msg,
         }
-        
         resp = requests.post(url, json=data, params=params, timeout=10)
         res = resp.json()
-        if res.get("errcode") == 0 or res.get("code") == 0:
-            return True
-        raise Exception(f"发送失败：{res}")
+        if res.get("errcode") != 0 and res.get("code") != 0:
+            raise Exception(f"{res.get('errmsg') or res}")
+        return True
 
-    def notify_admin(self, name, count):
-        """通知网管（纯文本提示）"""
-        if not ADMIN_USER_ID: 
-            print("⚠️ 未配置管理员ID，跳过通知")
-            return
-        
-        try:
-            token = self.get_access_token()
-            url = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
-            params = {"access_token": token}
-            content = f"新资产登记提醒\n员工：{name}\n数量：{count} 个 MAC 地址\n登记信息Excel文件已通过附件方式发送，请查收。"
-            data = {
-                "agent_id": DINGTALK_AGENT_ID,
-                "userid_list": ADMIN_USER_ID,
-                "msg": {
-                    "msgtype": "text",
-                    "text": {"content": content}
-                }
-            }
-            
-            resp = requests.post(url, json=data, params=params, timeout=10)
-            res = resp.json()
-            
-            if res.get("errcode") == 0:
-                print(f"📧 管理员文本通知发送成功")
-            else:
-                print(f"⚠️ 管理员文本通知发送失败：{res.get('errmsg')}")
-        except Exception as e:
-            print(f"⚠️ 管理员文本通知发送异常：{e}")
+    def send_verify_code(self, userid, code):
+        """发送验证码"""
+        self._send_work_msg(userid, {
+            "msgtype": "text",
+            "text": {"content": f"【资产登记】您的验证码是：{code}\n有效期 5 分钟。"}
+        })
+        return True
 
     def upload_media(self, file_path):
         """上传媒体文件到钉钉，返回media_id"""
-        try:
-            token = self.get_access_token()
-            url = "https://oapi.dingtalk.com/media/upload"
-            params = {"access_token": token, "type": "file"}
-            
-            if not os.path.exists(file_path):
-                raise Exception(f"文件不存在: {file_path}")
-            
-            with open(file_path, 'rb') as f:
-                files = {"media": (os.path.basename(file_path), f, "application/octet-stream")}
-                resp = requests.post(url, params=params, files=files, timeout=60)
-            
-            res = resp.json()
-            if res.get("errcode") == 0:
-                media_id = res.get("media_id")
-                print(f"✅ 媒体文件上传成功，media_id: {str(media_id)[:20]}...")
-                return media_id
-            else:
-                raise Exception(f"上传失败: {res}")
-        except Exception as e:
-            print(f"⚠️ 媒体文件上传异常：{e}")
-            return None
-
-    def send_file_to_admin(self, file_path, name, count, macs):
-        """将Excel文件发送给管理员"""
-        if not ADMIN_USER_ID:
-            print("⚠️ 未配置管理员ID，跳过发送文件")
-            return False
+        token = self.get_access_token()
+        url = "https://oapi.dingtalk.com/media/upload"
+        params = {"access_token": token, "type": "file"}
         
+        if not os.path.exists(file_path):
+            raise Exception(f"文件不存在: {file_path}")
+        
+        with open(file_path, 'rb') as f:
+            files = {"media": (os.path.basename(file_path), f, "application/octet-stream")}
+            resp = requests.post(url, params=params, files=files, timeout=60)
+        
+        res = resp.json()
+        if res.get("errcode") == 0:
+            return res.get("media_id")
+        raise Exception(f"上传失败: {res}")
+
+    def send_file_to_admin(self, file_path):
+        """将Excel文件发送给管理员（仅文件）"""
+        if not ADMIN_USER_ID:
+            raise Exception("未配置管理员ID")
+
         media_id = self.upload_media(file_path)
         if not media_id:
-            return False
-        
-        try:
-            token = self.get_access_token()
-            url = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
-            params = {"access_token": token}
-            
-            data = {
-                "agent_id": DINGTALK_AGENT_ID,
-                "userid_list": ADMIN_USER_ID,
-                "msg": {
-                    "msgtype": "file",
-                    "file": {"media_id": media_id}
-                }
-            }
-            
-            resp = requests.post(url, json=data, params=params, timeout=10)
-            res = resp.json()
-            
-            if res.get("errcode") == 0:
-                print(f"📎 Excel文件已通过钉钉发送给管理员")
-                return True
-            else:
-                print(f"⚠️ 文件发送失败：{res.get('errmsg')}")
-                return False
-        except Exception as e:
-            print(f"⚠️ 文件发送异常：{e}")
-            return False
+            raise Exception("文件上传失败，未获取到 media_id")
+
+        self._send_work_msg(ADMIN_USER_ID, {
+            "msgtype": "file",
+            "file": {"media_id": media_id}
+        })
+        return True
 
 
 def generate_mac_excel(user_name, macs):
@@ -272,7 +220,6 @@ def generate_mac_excel(user_name, macs):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "MAC登记"
-        
         
         # 数据表头
         ws.cell(row=1, column=1, value='MAC')
@@ -291,11 +238,9 @@ def generate_mac_excel(user_name, macs):
         ws.column_dimensions['C'].width = 40
         
         wb.save(file_path)
-        print(f"📄 Excel已生成：{file_path} ({os.path.getsize(file_path)} bytes)")
         return file_path
     except Exception as e:
-        print(f"❌ 生成Excel失败：{e}")
-        return None
+        raise Exception(f"生成Excel失败：{e}")
 
 
 def generate_code():
@@ -303,42 +248,85 @@ def generate_code():
     return "".join(random.choices(string.digits, k=6))
 
 def get_physical_macs():
-    """获取本机所有物理网卡 MAC"""
+    """获取本机所有物理网卡 MAC
+
+    通过 Windows Get-NetAdapter 的 InterfaceDescription 字段过滤虚拟网卡。
+    描述信息由驱动厂商定义（如 "Hyper-V Virtual Ethernet Adapter"），不受用户改网卡名影响，
+    比基于网卡名关键字过滤更稳定可靠。
+    """
+    # 获取网卡名→描述信息映射（描述由驱动厂商定义）
+    ps_script = (
+        "$ErrorActionPreference='Stop'; "
+        "Get-NetAdapter -IncludeHidden | ForEach-Object { "
+        "[PSCustomObject]@{Name=$_.Name;Desc=$_.InterfaceDescription} "
+        "} | ConvertTo-Json -Compress"
+    )
+    r = subprocess.run(
+        ['powershell', '-NoProfile', '-Command', ps_script],
+        capture_output=True, timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # 避免在 GUI 程序中弹出控制台窗口
+    )
+    # ConvertTo-Json 对非 ASCII 字符转成 \uXXXX 转义，优先 utf-8
+    raw = None
+    for enc in ('utf-8', 'gbk', 'gb18030'):
+        try:
+            decoded = r.stdout.decode(enc)
+            json.loads(decoded)
+            raw = decoded
+            break
+        except Exception:
+            continue
+    if raw is None:
+        raise Exception("无法解析 Get-NetAdapter 输出")
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        data = [data]
+    desc_map = {item.get('Name', ''): item.get('Desc', '') or '' for item in data}
+
+    # 描述信息中的虚拟网卡 / 伪接口关键字（厂商定义，稳定可靠）
+    skip_desc_keywords = [
+        'virtual',          # Hyper-V Virtual Ethernet Adapter / Wi-Fi Direct Virtual Adapter / Virtual Switch
+        'miniport',         # WAN Miniport (SSTP/IP/IPv6/...)
+        'tunnel',           # Teredo Tunneling Pseudo-Interface
+        'pseudo-interface', # 各类伪接口
+        'teredo', '6to4', 'isatap',  # 隧道协议适配器
+        'kernel debug',     # Microsoft Kernel Debug Network Adapter
+        'bluetooth',        # Bluetooth Device (PAN)
+    ]
+
     mac_list = []
     addrs = psutil.net_if_addrs()
-    
-    # 跳过虚拟网卡
-    skip_keywords = ['virtual', 'vmware', 'virtualbox', 'hyper-v', 'loopback', 'bluetooth', 'wsl', 'docker']
-    
     for iface, addr_list in addrs.items():
-        if any(k in iface.lower() for k in skip_keywords):
+        desc = desc_map.get(iface, '').lower()
+        if any(k in desc for k in skip_desc_keywords):
             continue
-        
+
         for addr in addr_list:
             if addr.family == psutil.AF_LINK and addr.address:
                 # 格式化MAC地址
                 mac = addr.address.replace(':', '-').upper()
                 if re.match(r"^([0-9A-F]{2}-){5}[0-9A-F]{2}$", mac):
                     mac_list.append(mac)
-    
+
     return mac_list
 
 class RegDialog(tk.Toplevel):
     """用户注册对话框"""
-    
-    def __init__(self, parent, users):
+
+    def __init__(self, parent, users, on_confirmed=None):
         """初始化对话框"""
         super().__init__(parent)
         self.title("君问公司资产自动登记")
-        self.geometry("400x320")
+        self.geometry("400x360")
         self.resizable(False, False)
         self.attributes('-topmost', True)
-        
+
         self.users = users
         self.selected_user = None
         self.verify_code_sent = None
-        self.confirmed = False
-        
+        self._status_after_id = None
+        self._on_confirmed = on_confirmed
+
         self.configure(bg="#f5f5f5")
         self._setup_ui()
 
@@ -355,22 +343,24 @@ class RegDialog(tk.Toplevel):
         style.map('Primary.TButton', foreground=[('active', 'white')], background=[('active', '#357abd')])
         style.configure('TEntry', fieldbackground='white', padding=6)
         style.configure('TCombobox', fieldbackground='white', padding=6)
-        
+        style.configure('Status.TLabel', background='#ffffff', relief='solid', borderwidth=1,
+                        font=('Microsoft YaHei', 10, 'bold'), padding=8)
+
         # 标题
         header_frame = ttk.Frame(self, style='TFrame')
         header_frame.pack(fill='x', padx=30, pady=(20, 10))
         ttk.Label(header_frame, text="君问公司资产自动登记工具", style='Header.TLabel').pack()
-        
+
         # 提示文字
-        ttk.Label(self, text="请选择本人并进行身份验证", style='TLabel', foreground='#666666').pack(pady=(5, 20))
-        
+        ttk.Label(self, text="请选择本人并进行身份验证", style='TLabel', foreground='#666666').pack(pady=(5, 15))
+
         # 主内容区
         main_frame = ttk.Frame(self, style='TFrame')
         main_frame.pack(fill='both', expand=True, padx=30)
-        
+
         # 第一行：姓名选择 + 获取验证码
         f1 = ttk.Frame(main_frame, style='TFrame')
-        f1.pack(fill='x', pady=15)
+        f1.pack(fill='x', pady=10)
         ttk.Label(f1, text="选择您的姓名", width=10, style='TLabel').pack(side='left')
         self.combo = ttk.Combobox(f1, values=[], state="normal", width=15)
         self.combo.pack(side='left', padx=5)
@@ -381,12 +371,21 @@ class RegDialog(tk.Toplevel):
 
         # 第二行：验证码输入 + 确定登记
         f3 = ttk.Frame(main_frame, style='TFrame')
-        f3.pack(fill='x', pady=15)
+        f3.pack(fill='x', pady=10)
         ttk.Label(f3, text="请输入验证码", width=10, style='TLabel').pack(side='left')
         self.entry_code = ttk.Entry(f3, width=15)
         self.entry_code.pack(side='left', padx=5)
         ttk.Button(f3, text="确 定 登 记", command=self._ok, style='Primary.TButton', width=12).pack(side='left', padx=10)
-        
+
+        # 状态提示（原生tk.Label确保颜色生效，非阻塞）
+        self.status_label = tk.Label(self, text="", anchor='center',
+                                     font=('Microsoft YaHei', 10, 'bold'),
+                                     bg="#f5f5f5", fg="#333333",
+                                     relief='flat', borderwidth=0,
+                                     pady=10, padx=10, height=2, wraplength=340,
+                                     justify='center')
+        self.status_label.pack(fill='x', padx=30, pady=(10, 15))
+
         # 初始化数据
         self._init_search_data()
 
@@ -421,179 +420,197 @@ class RegDialog(tk.Toplevel):
             self.entry_code.delete(0, tk.END)
             self.verify_code_sent = None
 
+    def _set_status(self, text, level='info', duration=5000):
+        """设置非阻塞状态提示文字，指定毫秒数后自动清空。
+        level: info(蓝)/success(绿)/warn(黄)/error(红)
+        """
+        # (前景色, 背景色, 边框色) —— 前景用深色确保高对比度可读
+        palette = {
+            'info':    ('#1a4b8c', '#e7f0fb', '#357abd'),
+            'success': ('#1e5a33', '#e6f5ec', '#2d8a4e'),
+            'warn':    ('#7a5200', '#fdf4dc', '#d9a22e'),
+            'error':   ('#8a0000', '#fdeaea', '#cc0000'),
+        }
+        fg, bg, bd = palette.get(level, palette['info'])
+        # 取消上一次未触发的清空定时器
+        if self._status_after_id is not None:
+            try:
+                self.status_label.after_cancel(self._status_after_id)
+            except Exception:
+                pass
+            self._status_after_id = None
+
+        if not text:
+            self._clear_status()
+            return
+
+        self.status_label.config(text=text, fg=fg, bg=bg, relief='solid',
+                                 borderwidth=2, highlightbackground=bd,
+                                 highlightthickness=1)
+        self.status_label.update_idletasks()
+        if duration and duration > 0:
+            self._status_after_id = self.status_label.after(
+                duration, self._clear_status)
+
+    def _clear_status(self):
+        self.status_label.config(text="", bg="#f5f5f5", fg="#333333",
+                                 relief='flat', borderwidth=0,
+                                 highlightthickness=0)
+        self._status_after_id = None
+
     def _send_code(self):
         """发送验证码"""
         if not self.selected_user:
-            messagebox.showwarning("提示", "请先选择您的姓名！")
+            self._set_status("请先选择您的姓名！", level='warn')
             return
-        
+
         self.btn_send.config(state="disabled", text="发送中...")
+        self._set_status("正在发送验证码，请稍候…", level='info', duration=0)
         try:
             code = generate_code()
             client.send_verify_code(self.selected_user['userid'], code)
             self.verify_code_sent = code
             self.btn_send.config(state="normal", text="重新发送")
-            messagebox.showinfo("成功", "验证码已发送至您的钉钉！")
+            self._set_status("✓ 验证码已发送至您的钉钉！", level='success', duration=6000)
         except Exception as e:
             self.btn_send.config(state="normal", text="获取验证码")
-            messagebox.showerror("发送失败", str(e))
+            self._set_status(f"发送失败：{e}", level='error', duration=10000)
 
     def _ok(self):
         """确认登记"""
         if not self.selected_user:
-            messagebox.showwarning("提示", "未选择姓名")
+            self._set_status("请先选择您的姓名！", level='warn')
             return
         if not self.verify_code_sent:
-            messagebox.showwarning("提示", "请先点击【获取验证码】")
+            self._set_status("请先点击【获取验证码】获取验证码", level='warn')
             return
         if self.entry_code.get().strip() != self.verify_code_sent:
-            messagebox.showerror("验证失败", "验证码错误，请重试")
+            self._set_status("验证码错误，请重新输入", level='error')
+            self.entry_code.delete(0, tk.END)
             return
-        
-        self.confirmed = True
-        self.destroy()
+
+        self.btn_send.config(state="disabled")
+        self.entry_code.config(state="disabled")
+        # 通过 after 调用回调，避免阻塞当前事件处理
+        if self._on_confirmed:
+            self.after(100, self._on_confirmed, self)
+
+    def show_progress(self, text):
+        """在状态栏显示处理进度"""
+        self._set_status(text, level='info', duration=0)
+        self.update_idletasks()
+        self.update()
+
+def _create_prompt_win(parent, initial_text=""):
+    """创建提示信息窗口（统一样式和居中位置）"""
+    win = tk.Toplevel(parent)
+    win.title("提示")
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = (sw - 300) // 2
+    y = (sh - 150) // 2
+    win.geometry(f"300x150+{x}+{y}")
+    win.resizable(False, False)
+    win.attributes('-topmost', True)
+    win.configure(bg="#f5f5f5")
+    label = ttk.Label(win, text=initial_text, style='Info.TLabel', wraplength=280)
+    label.pack(expand=True)
+    win.update_idletasks()
+    win.update()
+    win.lift()
+    win.focus_force()
+    return win, label
+
+
+def _show_error_in_win(root, win, label, message):
+    """在提示窗口中显示错误信息并等待用户确认"""
+    label.config(text=message, style='Error.TLabel')
+    ttk.Button(win, text="确定", command=win.destroy).pack(pady=10)
+    win.update()
+    root.wait_window(win)
+    root.destroy()
+
+
+def _show_result_in_win(dialog, message, success=True):
+    """关闭主对话框，弹出提示信息窗口显示登记结果并等待用户确认。
+
+    成功用 Info 样式（灰色），失败用 Error 样式（红色）。
+    不销毁 root，由 main 末尾统一销毁。
+    """
+    root = dialog.master
+    dialog.destroy()
+
+    win, label = _create_prompt_win(root, message)
+    label.config(style='Info.TLabel' if success else 'Error.TLabel')
+    ttk.Button(win, text="确定", command=win.destroy).pack(pady=10)
+    win.update()
+    root.wait_window(win)
+
 
 def main():
     """主函数"""
     root = tk.Tk()
-    
-    # 设置主窗口样式（与操作界面一致）
-    root.title("君问公司资产自动登记")
-    root.geometry("400x200")
-    root.resizable(False, False)
-    root.attributes('-topmost', True)
-    root.configure(bg="#f5f5f5")
-    
-    # 设置样式（与操作界面一致）
-    style = ttk.Style()
-    style.theme_use('clam')
-    style.configure('TFrame', background='#f5f5f5')
-    style.configure('TLabel', background='#f5f5f5', font=('Microsoft YaHei', 10), foreground='#666666')
-    style.configure('Header.TLabel', background='#f5f5f5', font=('Microsoft YaHei', 14, 'bold'), foreground='#333333')
-    
-    # 标题区域（与操作界面一致）
-    header_frame = ttk.Frame(root, style='TFrame')
-    header_frame.pack(fill='x', padx=30, pady=(30, 10))
-    ttk.Label(header_frame, text="君问公司资产自动登记工具", style='Header.TLabel').pack()
-    
-    # 提示文字（与操作界面一致）
-    ttk.Label(root, text="程序正在启动，请稍等……", style='TLabel').pack(pady=20)
-    
-    root.update()
-    
-    print("🚀 正在启动资产登记助手...")
-    
-    global client
-    
-    try:
-        print("📱 初始化钉钉客户端...")
-        client = DingTalkClient(DINGTALK_APP_KEY, DINGTALK_APP_SECRET)
-        
-        print("📞 正在同步通讯录...")
-        users = client.get_all_users()
-        
-        if not users:
-            messagebox.showerror("错误", "无法获取通讯录，请检查 AppKey/Secret 及权限。")
-            root.destroy()
-            return
-            
-        print(f"✅ 成功获取 {len(users)} 名员工信息")
-            
-    except Exception as e:
-        messagebox.showerror("初始化失败", str(e))
-        root.destroy()
-        return
-    
-    # 关闭启动界面，显示操作窗口
-    root.destroy()
-    
-    # 创建新的主窗口
-    root = tk.Tk()
     root.withdraw()
 
-    # 2. 弹出交互窗口
-    dialog = RegDialog(root, users)
-    root.wait_window(dialog)
-    
-    if not dialog.confirmed:
-        print("用户取消操作。")
-        return
+    # 设置统一样式
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure('Info.TLabel', background='#f5f5f5', font=('Microsoft YaHei', 10), foreground='#666666')
+    style.configure('Error.TLabel', background='#f5f5f5', font=('Microsoft YaHei', 10), foreground='#cc0000')
+    style.configure('TButton', font=('Microsoft YaHei', 10), padding=8)
 
-    user = dialog.selected_user
-    print(f"✅ 用户 {user['name']} 验证通过。")
-    
-    # 3. 扫描物理网卡
-    print("🔍 正在扫描本地物理网卡...")
-    macs = get_physical_macs()
-    
-    if not macs:
-        messagebox.showerror("错误", "未检测到任何物理网卡地址。\n请检查网络连接或联系管理员。")
-        return
+    # === 初始化阶段：弹出提示窗口显示进度 ===
+    info_win, info_label = _create_prompt_win(root, "程序正在启动，请稍等……")
 
-    # 4. 显示扫描到的网卡
-    print(f"✅ 扫描到 {len(macs)} 个物理网卡：")
-    for m in macs:
-        print(f"   - {m}")
-    
-    # 5. 生成Excel并发送给管理员
-    print("📝 正在生成登记信息Excel文件...")
-    
-    # 显示进度
-    progress_win = tk.Toplevel(root)
-    progress_win.title("处理中")
-    progress_win.geometry("320x110")
-    progress_win.attributes('-topmost', True)
-    ttk.Label(progress_win, text=f"发现 {len(macs)} 个网卡\n正在生成Excel并发送给管理员...").pack(pady=20)
-    root.update()
+    global client
 
-    excel_path = None
     try:
-        # 生成Excel
-        excel_path = generate_mac_excel(user['name'], macs)
-        if not excel_path:
-            raise Exception("Excel文件生成失败")
-        
-        print("📤 正在通过钉钉发送Excel给管理员...")
-        
-        # 发送文本通知 + Excel附件
-        file_sent = client.send_file_to_admin(excel_path, user['name'], len(macs), macs)
-        client.notify_admin(user['name'], len(macs))
-        
-        success_count = len(macs)
-        
-        # 清理进度窗口
-        progress_win.destroy()
-        
-        # 6. 结果反馈
-        msg = f"登记完成！\n\n员工：{user['name']}\n成功登记：{success_count} 个 MAC 地址\n"
-        if file_sent:
-            msg += "登记Excel已发送给管理员。"
-        else:
-            msg += "Excel发送失败，请手动将文件交给管理员。\n文件位置：\n" + excel_path
-        
-        messagebox.showinfo("完成", msg)
-        
-        # 最后销毁主窗口
-        root.destroy()
-            
+        info_label.config(text="正在初始化钉钉客户端...")
+        info_win.update_idletasks()
+        info_win.update()
+        client = DingTalkClient(DINGTALK_APP_KEY, DINGTALK_APP_SECRET)
+
+        info_label.config(text="正在同步通讯录...")
+        info_win.update_idletasks()
+        info_win.update()
+        users = client.get_all_users()
+
+        if not users:
+            _show_error_in_win(root, info_win, info_label, "无法获取通讯录，请检查配置及权限。")
+            return
+
     except Exception as e:
-        # 错误处理
-        progress_win.destroy()
-        # 保留生成的临时文件便于排错
-        root.destroy()
-        extra = f"\n生成的文件：{excel_path}" if excel_path else ""
-        messagebox.showerror("错误", f"登记失败：{e}{extra}")
-        print(f"❌ 登记失败：{e}")
+        _show_error_in_win(root, info_win, info_label, f"初始化失败：{e}")
+        return
+
+    # 成功：关闭提示窗口，弹出主程序窗口
+    info_win.destroy()
+
+    def _process_registration(dialog):
+        """验证通过后的处理流程，在 dialog 状态栏显示进度"""
+        user = dialog.selected_user
+        try:
+            dialog.show_progress("正在扫描本地网卡...")
+            macs = get_physical_macs()
+
+            if not macs:
+                _show_result_in_win(dialog, "未检测到物理网卡，请检查网络连接。", success=False)
+                return
+
+            dialog.show_progress("正在生成登记文件...")
+            excel_path = generate_mac_excel(user['name'], macs)
+
+            dialog.show_progress("正在发送给管理员...")
+            client.send_file_to_admin(excel_path)
+
+            _show_result_in_win(dialog, "资产登记完成！请联系网络管理员。", success=True)
+
+        except Exception as e:
+            _show_result_in_win(dialog, f"登记失败：{e}", success=False)
+
+    dialog = RegDialog(root, users, on_confirmed=_process_registration)
+    root.wait_window(dialog)
+    root.destroy()
 
 if __name__ == "__main__":
-    try:
-        import psutil, requests, tkinter
-        import openpyxl
-    except ImportError as e:
-        print(f"❌ 缺少依赖库：{e}")
-        print("请运行命令安装：pip install psutil requests openpyxl")
-        input("按回车退出...")
-        sys.exit(1)
-    
-    # 运行主函数
     main()
